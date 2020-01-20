@@ -18,9 +18,12 @@ from __future__ import absolute_import, division, print_function
 
 import logging
 import os
+import tqdm
 import math
 from random import shuffle
 logger = logging.getLogger(__name__)
+
+import torch
 
 class InputExample(object):
     """A single training/test example for simple sequence classification."""
@@ -247,14 +250,29 @@ class PeopledailyProcessor(DataProcessor):
         return self._create_examples(
             self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
 
-    def get_labels(self):
-        return ["O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC", "[CLS]", "[SEP]"]
+    def get_labels(self, data_dir):
+        # return ["O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC", "[CLS]", "[SEP]"]
+
+        # labels = set()
+        # with open(os.path.join(data_dir, 'train.tsv')) as f:
+        #     for line in f:
+        #         line = line.strip()
+        #         items = line.split('\t')
+        #         if len(items) != 2:
+        #             continue
+        #         _, label = items
+        #         labels.add(label)
+        # labels = list(labels)
+        # labels.extend(['[CLS]', '[SEP]'])
+        # return labels
+
+        return ["O", "B-PER", "M-PER", "E-PER", "[CLS]", "[SEP]"]
 
     def _create_examples(self, lines, set_type):
         examples = []
         for i, (sentence, label) in enumerate(lines):
             guid = "%s-%s" % (set_type, i)
-            text_a = ' '.join(sentence)
+            text_a = '<C-SEP>'.join(sentence)
             text_b = None
             label = label
             examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
@@ -299,13 +317,22 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
     label_map = {label: i for i, label in enumerate(label_list, 1)}
 
     features = []
-    for (ex_index, example) in enumerate(examples):
-        textlist = example.text_a.split(' ')
+    for (ex_index, example) in enumerate(tqdm.tqdm(examples, desc='Converting examples')):
+        # split(' ')会导致句子中的空格被错分，使用`<S-SEP>`作为句子分隔符
+        # textlist = [c for c in example.text_a.split(' ') if c]
+        textlist = example.text_a.split('<C-SEP>')
         labellist = example.label
         tokens = []
         labels = []
         valid = []
         label_mask = []
+
+        # logger.info(example.text_a)
+        # logger.info(textlist)
+        # logger.info(f'len(textlist) is {len(textlist)}')
+        # logger.info(labellist)
+        # break
+
         for i, word in enumerate(textlist):
             token = tokenizer.tokenize(word)
             tokens.extend(token)
@@ -416,6 +443,156 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
                           valid_ids=valid,
                           label_mask=label_mask))
     return features
+
+def convert_singlel_example_to_feature(example, label_list, max_seq_length, tokenizer, ngram_dict):
+    """Loads a data file into a list of `InputBatch`s."""
+
+    label_map = {label: i for i, label in enumerate(label_list, 1)}
+
+    # features = []
+    # for (ex_index, example) in enumerate(tqdm.tqdm(examples, desc='Converting examples')):
+
+
+    # split(' ')会导致句子中的空格被错分，使用`<S-SEP>`作为句子分隔符
+    # textlist = [c for c in example.text_a.split(' ') if c]
+    textlist = example.text_a.split('<C-SEP>')
+    labellist = example.label
+    tokens = []
+    labels = []
+    valid = []
+    label_mask = []
+
+    # logger.info(example.text_a)
+    # logger.info(textlist)
+    # logger.info(f'len(textlist) is {len(textlist)}')
+    # logger.info(labellist)
+    # break
+
+    for i, word in enumerate(textlist):
+        token = tokenizer.tokenize(word)
+        tokens.extend(token)
+        label_1 = labellist[i]
+        for m in range(len(token)):
+            if m == 0:
+                labels.append(label_1)
+                valid.append(1)
+                label_mask.append(1)
+            else:
+                valid.append(0)
+    if len(tokens) >= max_seq_length - 1:
+        tokens = tokens[0:(max_seq_length - 2)]
+        labels = labels[0:(max_seq_length - 2)]
+        valid = valid[0:(max_seq_length - 2)]
+        label_mask = label_mask[0:(max_seq_length - 2)]
+    ntokens = []
+    segment_ids = []
+    label_ids = []
+    ntokens.append("[CLS]")
+    segment_ids.append(0)
+    valid.insert(0, 1)
+    label_mask.insert(0, 1)
+    label_ids.append(label_map["[CLS]"])
+    for i, token in enumerate(tokens):
+        ntokens.append(token)
+        segment_ids.append(0)
+        if len(labels) > i:
+            label_ids.append(label_map[labels[i]])
+    ntokens.append("[SEP]")
+    segment_ids.append(0)
+    valid.append(1)
+    label_mask.append(1)
+    label_ids.append(label_map["[SEP]"])
+    input_ids = tokenizer.convert_tokens_to_ids(ntokens)
+    input_mask = [1] * len(input_ids)
+    label_mask = [1] * len(label_ids)
+    while len(input_ids) < max_seq_length:
+        input_ids.append(0)
+        input_mask.append(0)
+        segment_ids.append(0)
+        label_ids.append(0)
+        valid.append(1)
+        label_mask.append(0)
+    while len(label_ids) < max_seq_length:
+        label_ids.append(0)
+        label_mask.append(0)
+    assert len(input_ids) == max_seq_length
+    assert len(input_mask) == max_seq_length
+    assert len(segment_ids) == max_seq_length
+    assert len(label_ids) == max_seq_length
+    assert len(valid) == max_seq_length
+    assert len(label_mask) == max_seq_length
+
+    # ----------- code for ngram BEGIN-----------
+    ngram_matches = []
+    #  Filter the ngram segment from 2 to 7 to check whether there is a ngram
+    for p in range(2, 8):
+        for q in range(0, len(tokens) - p + 1):
+            character_segment = tokens[q:q + p]
+            # j is the starting position of the ngram
+            # i is the length of the current ngram
+            character_segment = tuple(character_segment)
+            if character_segment in ngram_dict.ngram_to_id_dict:
+                ngram_index = ngram_dict.ngram_to_id_dict[character_segment]
+                ngram_matches.append([ngram_index, q, p, character_segment])
+
+    shuffle(ngram_matches)
+
+    max_ngram_in_seq_proportion = math.ceil((len(tokens) / max_seq_length) * ngram_dict.max_ngram_in_seq)
+    if len(ngram_matches) > max_ngram_in_seq_proportion:
+        ngram_matches = ngram_matches[:max_ngram_in_seq_proportion]
+
+    ngram_ids = [ngram[0] for ngram in ngram_matches]
+    ngram_positions = [ngram[1] for ngram in ngram_matches]
+    ngram_lengths = [ngram[2] for ngram in ngram_matches]
+    ngram_tuples = [ngram[3] for ngram in ngram_matches]
+    ngram_seg_ids = [0 if position < (len(tokens) + 2) else 1 for position in ngram_positions]
+
+    import numpy as np
+    ngram_mask_array = np.zeros(ngram_dict.max_ngram_in_seq, dtype=np.bool)
+    ngram_mask_array[:len(ngram_ids)] = 1
+
+    # record the masked positions
+    ngram_positions_matrix = np.zeros(shape=(max_seq_length, ngram_dict.max_ngram_in_seq), dtype=np.int32)
+    for i in range(len(ngram_ids)):
+        ngram_positions_matrix[ngram_positions[i]:ngram_positions[i] + ngram_lengths[i], i] = 1.0
+
+    # Zero-pad up to the max ngram in seq length.
+    padding = [0] * (ngram_dict.max_ngram_in_seq - len(ngram_ids))
+    ngram_ids += padding
+    ngram_lengths += padding
+    ngram_seg_ids += padding
+
+    # ----------- code for ngram END-----------
+
+    # return InputFeatures(input_ids=input_ids,
+    #                   input_mask=input_mask,
+    #                   segment_ids=segment_ids,
+    #                   label_id=label_ids,
+    #                   ngram_ids=ngram_ids,
+    #                   ngram_positions=ngram_positions_matrix,
+    #                   ngram_lengths=ngram_lengths,
+    #                   ngram_tuples=ngram_tuples,
+    #                   ngram_seg_ids=ngram_seg_ids,
+    #                   ngram_masks=ngram_mask_array,
+    #                   valid_ids=valid,
+    #                   label_mask=label_mask)
+    from collections import OrderedDict
+    feature = OrderedDict({'input_ids': input_ids,
+              'input_mask': input_mask,
+              'segment_ids': segment_ids,
+              'label_id': label_ids,
+              'ngram_ids': ngram_ids,
+              'ngram_positions': ngram_positions_matrix,
+              'ngram_lengths': ngram_lengths,
+              # 'ngram_tuples': ngram_tuples,
+              'ngram_seg_ids': ngram_seg_ids,
+              'ngram_masks': ngram_mask_array,
+              'valid_ids': valid,
+              'label_mask': label_mask})
+    # for k, v in feature.items():
+    #     print(k, torch.tensor(v).size())
+    return {k: torch.tensor(v) for k, v in feature.items()}
+
 
 processors = {
     "conll":ConllProcessor,

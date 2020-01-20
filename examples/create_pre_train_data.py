@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Create data for pretrain."""
-
+import sys
 
 from argparse import ArgumentParser
 from pathlib import Path
@@ -34,8 +34,7 @@ class DocumentDatabase():
             self.temp_dir = TemporaryDirectory()
             self.working_dir = Path(self.temp_dir.name)
             self.document_shelf_filepath = self.working_dir / 'shelf.db'
-            self.document_shelf = shelve.open(str(self.document_shelf_filepath),
-                                              flag='n', protocol=-1)
+            self.document_shelf = shelve.open(str(self.document_shelf_filepath))
             self.documents = None
         else:
             self.documents = []
@@ -253,7 +252,10 @@ def create_instances_from_document(
                     is_random_next = False
                     for j in range(a_end, len(current_chunk)):
                         tokens_b.extend(current_chunk[j])
+
+
                 truncate_seq_pair(tokens_a, tokens_b, max_num_tokens)
+
 
 
                 tokens = ["[CLS]"] + tokens_a + ["[SEP]"] + tokens_b + ["[SEP]"]
@@ -318,6 +320,7 @@ def main():
 
     parser.add_argument("--epochs_to_generate", type=int, default=3,
                         help="Number of epochs of data to pregenerate")
+    parser.add_argument("--start_epoch", type=int, default=0)
     parser.add_argument("--max_seq_len", type=int, default=128)
     parser.add_argument("--short_seq_prob", type=float, default=0.1,
                         help="Probability of making a short sentence as a training example")
@@ -333,7 +336,7 @@ def main():
 
     tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
     vocab_list = list(tokenizer.vocab.keys())
-    ngram_dict = ZenNgramDict(args.bert_model, tokenizer=tokenizer)
+    ngram_dict = ZenNgramDict(args.bert_model, tokenizer=tokenizer, max_ngram_in_seq=args.max_ngram_in_sequence)
 
     with DocumentDatabase(reduce_memory=args.reduce_memory) as docs:
         with args.train_corpus.open() as f:
@@ -346,6 +349,8 @@ def main():
                 else:
                     tokens = tokenizer.tokenize(line)
                     doc.append(tokens)
+                # if len(docs) > 1:
+                #     break
             if doc:
                 docs.add_document(doc)  # If the last doc didn't end on a newline, make sure it still gets added
         if len(docs) <= 1:
@@ -356,7 +361,7 @@ def main():
                  "sections or paragraphs.")
 
         args.output_dir.mkdir(exist_ok=True)
-        for epoch in trange(args.epochs_to_generate, desc="Epoch"):
+        for epoch in trange(args.start_epoch, args.epochs_to_generate, desc="Epoch"):
             epoch_filename = args.output_dir / f"epoch_{epoch}.json"
             num_instances = 0
             with epoch_filename.open('w') as epoch_file:

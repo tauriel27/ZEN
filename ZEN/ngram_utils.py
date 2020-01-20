@@ -37,15 +37,22 @@ class ZenNgramDict(object):
         self.id_to_ngram_list = ["[pad]"]
         self.ngram_to_id_dict = {"[pad]": 0}
         self.ngram_to_freq_dict = {}
+        self.ngram_size = 0
 
         logger.info("loading ngram frequency file {}".format(ngram_freq_path))
         with open(ngram_freq_path, "r", encoding="utf-8") as fin:
             for i, line in enumerate(fin):
-                ngram,freq = line.split(",")
+                line = line.strip()
+                items = line.split(',')
+                if len(items) != 2:
+                    continue
+                ngram,freq = items
                 tokens = tuple(tokenizer.tokenize(ngram))
                 self.ngram_to_freq_dict[ngram] = freq
                 self.id_to_ngram_list.append(tokens)
                 self.ngram_to_id_dict[tokens] = i + 1
+
+        self.ngram_size = i + 1
 
     def save(self, ngram_freq_path):
         with open(ngram_freq_path, "w", encoding="utf-8") as fout:

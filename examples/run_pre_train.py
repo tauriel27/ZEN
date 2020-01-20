@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch pretrain for ZEN model."""
+import sys
 
 from argparse import ArgumentParser
 from pathlib import Path
@@ -30,6 +31,8 @@ from torch.utils.data import DataLoader, Dataset, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
+from tensorboardX import SummaryWriter
+
 from ZEN import WEIGHTS_NAME, CONFIG_NAME
 from ZEN import ZenConfig, ZenForPreTraining
 from ZEN import BertTokenizer
@@ -42,6 +45,16 @@ InputFeatures = namedtuple(
 log_format = '%(asctime)-10s: %(message)s'
 logging.basicConfig(level=logging.INFO, format=log_format)
 
+NGRAM_DICT_NAME = 'ngram.txt'
+
+def get_ngram_size(bert_model_path):
+    """
+    Get ngram size.
+    :param bert_model_path:
+    :return:
+    """
+    ngram_path = os.path.join(bert_model_path, NGRAM_DICT_NAME)
+    return int(os.popen(f"wc -l {ngram_path}").read().split()[0])
 
 def convert_example_to_features(example, tokenizer, max_seq_length, max_ngram_in_sequence):
     tokens = example["tokens"]
@@ -56,11 +69,43 @@ def convert_example_to_features(example, tokenizer, max_seq_length, max_ngram_in
     ngram_lengths = example["ngram_lengths"]
     ngram_segment_ids = example["ngram_segment_ids"]
 
+    # def truncate_seq_pair(tokens_a, tokens_b, max_num_tokens):
+    #     """Truncates a pair of sequences to a maximum sequence length. Lifted from Google's BERT repo."""
+    #     while True:
+    #         total_length = len(tokens_a) + len(tokens_b)
+    #         if total_length <= max_num_tokens:
+    #             break
+    #
+    #         trunc_tokens = tokens_a if len(tokens_a) > len(tokens_b) else tokens_b
+    #         assert len(trunc_tokens) >= 1
+    #
+    #         # We want to sometimes truncate from the front and sometimes from the
+    #         # back to add more randomness and avoid biases.
+    #         if random.random() < 0.5:
+    #             del trunc_tokens[0]
+    #         else:
+    #             trunc_tokens.pop()
+    #
+    #
+    # sep_idx = tokens.index('[SEP]')
+    # tokens_a = tokens[1:sep_idx]
+    # tokens_b = tokens[sep_idx:-1]
+    # truncate_seq_pair(tokens_a, tokens_b, max_seq_length - 3)
+    #
+    # tokens = ["[CLS]"] + tokens_a + ["[SEP]"] + tokens_b + ["[SEP]"]
+    # # The segment IDs are 0 for the [CLS] token, the A tokens and the first [SEP]
+    # # They are 1 for the B tokens and the final [SEP]
+    #
+    # segment_ids = [0 for _ in range(len(tokens_a) + 2)] + [1 for _ in range(len(tokens_b) + 1)]
+
     assert len(tokens) == len(segment_ids) <= max_seq_length  # The preprocessed data should be already truncated
+
+
     input_ids = tokenizer.convert_tokens_to_ids(tokens)
     masked_label_ids = tokenizer.convert_tokens_to_ids(masked_lm_labels)
 
     input_array = np.zeros(max_seq_length, dtype=np.int)
+
     input_array[:len(input_ids)] = input_ids
 
     mask_array = np.zeros(max_seq_length, dtype=np.bool)
@@ -74,6 +119,7 @@ def convert_example_to_features(example, tokenizer, max_seq_length, max_ngram_in
 
     # add ngram pads
     ngram_id_array = np.zeros(max_ngram_in_sequence, dtype=np.int)
+
     ngram_id_array[:len(ngram_ids)] = ngram_ids
 
     # record the masked positions
@@ -111,11 +157,12 @@ def convert_example_to_features(example, tokenizer, max_seq_length, max_ngram_in
 
 
 class PregeneratedDataset(Dataset):
-    def __init__(self, training_path, epoch, tokenizer, num_data_epochs, reduce_memory=False, fp16=False):
+    def __init__(self, training_path, epoch, tokenizer, num_data_epochs, reduce_memory=False, fp16=False, load_exist=False):
         self.vocab = tokenizer.vocab
         self.tokenizer = tokenizer
         self.epoch = epoch
-        self.data_epoch = epoch % num_data_epochs
+        # self.data_epoch = epoch % num_data_epochs
+        self.data_epoch = epoch
         data_file = training_path / f"epoch_{self.data_epoch}.json"
         metrics_file = training_path / f"epoch_{self.data_epoch}_metrics.json"
         assert data_file.is_file() and metrics_file.is_file()
@@ -126,39 +173,46 @@ class PregeneratedDataset(Dataset):
         self.temp_dir = None
         self.working_dir = None
         self.fp16 = fp16
+        self.temp_dir = "/tmp"
+        # TemporaryDirectory()
+        self.working_dir = Path(self.temp_dir)
         if reduce_memory:
-            self.temp_dir = "/tmp"
-            # TemporaryDirectory()
-            self.working_dir = Path(self.temp_dir)
+
+            if load_exist:
+                mode = 'r+'
+            else:
+                mode = 'w+'
+
             input_ids = np.memmap(filename=self.working_dir / 'input_ids.memmap',
-                                  mode='w+', dtype=np.int32, shape=(num_samples, seq_len))
+                                  mode=mode, dtype=np.int32, shape=(num_samples, seq_len))
             input_masks = np.memmap(filename=self.working_dir / 'input_masks.memmap',
-                                    shape=(num_samples, seq_len), mode='w+', dtype=np.bool)
+                                    shape=(num_samples, seq_len), mode=mode, dtype=np.bool)
             segment_ids = np.memmap(filename=self.working_dir / 'segment_ids.memmap',
-                                    shape=(num_samples, seq_len), mode='w+', dtype=np.bool)
+                                    shape=(num_samples, seq_len), mode=mode, dtype=np.bool)
             lm_label_ids = np.memmap(filename=self.working_dir / 'lm_label_ids.memmap',
-                                     shape=(num_samples, seq_len), mode='w+', dtype=np.int32)
+                                     shape=(num_samples, seq_len), mode=mode, dtype=np.int32)
             lm_label_ids[:] = -1
+
             is_nexts = np.memmap(filename=self.working_dir / 'is_nexts.memmap',
-                                 shape=(num_samples,), mode='w+', dtype=np.bool)
+                                 shape=(num_samples,), mode=mode, dtype=np.bool)
             # add ngram level features
             ngram_ids = np.memmap(filename=self.working_dir / 'ngram_ids.memmap',
-                                 mode='w+', dtype=np.int32, shape=(num_samples, max_ngram_in_sequence))
+                                 mode=mode, dtype=np.int32, shape=(num_samples, max_ngram_in_sequence))
 
             ngram_masks = np.memmap(filename=self.working_dir / 'ngram_masks.memmap',
-                                   mode='w+', dtype=np.bool, shape=(num_samples, max_ngram_in_sequence))
+                                   mode=mode, dtype=np.bool, shape=(num_samples, max_ngram_in_sequence))
 
             ngram_positions = np.memmap(filename=self.working_dir / 'ngram_positions.memmap',
-                                      mode='w+', dtype=np.bool, shape=(num_samples, seq_len, max_ngram_in_sequence))
+                                      mode=mode, dtype=np.bool, shape=(num_samples, seq_len, max_ngram_in_sequence))
 
             ngram_starts = np.memmap(filename=self.working_dir / 'ngram_starts.memmap',
-                                    mode='w+', dtype=np.int32, shape=(num_samples, max_ngram_in_sequence))
+                                    mode=mode, dtype=np.int32, shape=(num_samples, max_ngram_in_sequence))
 
             ngram_lengths = np.memmap(filename=self.working_dir / 'ngram_lengths.memmap',
-                                     mode='w+', dtype=np.int32, shape=(num_samples, max_ngram_in_sequence))
+                                     mode=mode, dtype=np.int32, shape=(num_samples, max_ngram_in_sequence))
 
             ngram_segment_ids = np.memmap(filename=self.working_dir / 'ngram_segment_ids.memmap',
-                                         mode='w+', dtype=np.bool, shape=(num_samples, max_ngram_in_sequence))
+                                         mode=mode, dtype=np.bool, shape=(num_samples, max_ngram_in_sequence))
 
         else:
             input_ids = np.zeros(shape=(num_samples, seq_len), dtype=np.int32)
@@ -171,32 +225,38 @@ class PregeneratedDataset(Dataset):
             ngram_ids = np.zeros(shape=(num_samples, max_ngram_in_sequence), dtype=np.int32)
             ngram_masks = np.zeros(shape=(num_samples, max_ngram_in_sequence), dtype=np.bool)
 
-            ngram_positions = np.zeros(shape=(num_samples, seq_len, max_ngram_in_sequence), dtype=np.bool)
+            # ngram_positions = np.zeros(shape=(num_samples, seq_len, max_ngram_in_sequence), dtype=np.bool)
+            ngram_positions = np.memmap(filename=self.working_dir / 'ngram_positions.memmap',
+                                        mode='w+', dtype=np.bool, shape=(num_samples, seq_len, max_ngram_in_sequence))
             ngram_starts = np.zeros(shape=(num_samples, max_ngram_in_sequence), dtype=np.int32)
             ngram_lengths = np.zeros(shape=(num_samples, max_ngram_in_sequence), dtype=np.int32)
 
             ngram_segment_ids = np.zeros(shape=(num_samples, max_ngram_in_sequence), dtype=np.bool)
 
         logging.info(f"Loading training examples for epoch {epoch}")
-        with data_file.open() as f:
-            for i, line in enumerate(tqdm(f, total=num_samples, desc="Training examples")):
-                line = line.strip()
-                example = json.loads(line)
-                features = convert_example_to_features(example, tokenizer, seq_len, max_ngram_in_sequence)
-                input_ids[i] = features.input_ids
-                segment_ids[i] = features.segment_ids
-                input_masks[i] = features.input_mask
-                lm_label_ids[i] = features.lm_label_ids
-                is_nexts[i] = features.is_next
-                # add ngram related ids
-                ngram_ids[i] = features.ngram_ids
-                ngram_masks[i] = features.ngram_masks
-                ngram_positions[i] = features.ngram_positions
-                ngram_starts[i] = features.ngram_starts
-                ngram_lengths[i] = features.ngram_lengths
-                ngram_segment_ids[i] = features.ngram_segment_ids
+        if not load_exist:
+            with data_file.open() as f:
+                for i, line in enumerate(tqdm(f, total=num_samples, desc="Training examples")):
+                    line = line.strip()
+                    example = json.loads(line)
+                    features = convert_example_to_features(example, tokenizer, seq_len, max_ngram_in_sequence)
+                    input_ids[i] = features.input_ids
+                    segment_ids[i] = features.segment_ids
+                    input_masks[i] = features.input_mask
+                    lm_label_ids[i] = features.lm_label_ids
+                    is_nexts[i] = features.is_next
+                    # add ngram related ids
+                    ngram_ids[i] = features.ngram_ids
+                    ngram_masks[i] = features.ngram_masks
+                    ngram_positions[i] = features.ngram_positions
+                    ngram_starts[i] = features.ngram_starts
+                    ngram_lengths[i] = features.ngram_lengths
+                    ngram_segment_ids[i] = features.ngram_segment_ids
 
-        assert i == num_samples - 1  # Assert that the sample count metric was true
+            assert i == num_samples - 1  # Assert that the sample count metric was true
+
+
+
         logging.info("Loading complete!")
         self.num_samples = num_samples
         self.seq_len = seq_len
@@ -246,6 +306,7 @@ def main():
     parser.add_argument("--do_lower_case", action="store_true")
     parser.add_argument("--reduce_memory", action="store_true",
                         help="Store training data as on-disc memmaps to massively reduce memory usage")
+    parser.add_argument("--load_exist", action='store_true', help="Load np.memmap cache")
 
     parser.add_argument("--epochs", type=int, default=3, help="Number of epochs to train for")
     parser.add_argument("--local_rank",
@@ -355,7 +416,8 @@ def main():
         num_train_optimization_steps = num_train_optimization_steps // torch.distributed.get_world_size()
 
     if args.scratch:
-        config = ZenConfig(21128, 104089)
+        # ngram embedding size 需要额外+1
+        config = ZenConfig(21128, get_ngram_size(args.bert_model) + 1)
         model = ZenForPreTraining(config)
     else:
         model = ZenForPreTraining.from_pretrained(args.bert_model)
@@ -384,7 +446,7 @@ def main():
 
     if args.fp16:
         try:
-            from apex.optimizers import FP16_Optimizer
+            from apex.fp16_utils import FP16_Optimizer
             from apex.optimizers import FusedAdam
         except ImportError:
             raise ImportError(
@@ -393,7 +455,7 @@ def main():
         optimizer = FusedAdam(optimizer_grouped_parameters,
                               lr=args.learning_rate,
                               bias_correction=False,
-                              max_grad_norm=1.0)
+                              )
         if args.loss_scale == 0:
             optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
         else:
@@ -406,25 +468,35 @@ def main():
                              warmup=args.warmup_proportion,
                              t_total=num_train_optimization_steps)
 
-    global_step = 0
+    import shutil
+    tb_log_dir = os.path.join(args.output_dir, 'tb-log')
+    if os.path.exists(tb_log_dir):
+        shutil.rmtree(tb_log_dir)
+    tb_writer = SummaryWriter(tb_log_dir)
+
+    # 修改学习率阶段
+    # global_step = total_train_examples / args.epochs * 4
+    start_step = 120000
+    global_step = start_step
     logging.info("***** Running training *****")
     logging.info("  Num examples = %d", total_train_examples)
     logging.info("  Batch size = %d", args.train_batch_size)
     logging.info("  Num steps = %d", num_train_optimization_steps)
     model.train()
-    for epoch in range(args.epochs):
-
+    for epoch in range(args.already_trained_epoch+1, args.epochs):
+        ## 数据从data_new第0份开始读
         epoch_dataset = PregeneratedDataset(epoch=epoch,
                                             training_path=args.pregenerated_data,
                                             tokenizer=tokenizer,
                                             num_data_epochs=num_data_epochs,
                                             reduce_memory=args.reduce_memory,
-                                            fp16=args.fp16)
+                                            fp16=args.fp16, load_exist=args.load_exist)
         if args.local_rank == -1:
             train_sampler = RandomSampler(epoch_dataset)
         else:
             train_sampler = DistributedSampler(epoch_dataset)
-        train_dataloader = DataLoader(epoch_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
+        train_dataloader = DataLoader(epoch_dataset, sampler=train_sampler,
+                                      batch_size=args.train_batch_size, num_workers=8)
         tr_loss = 0
         nb_tr_examples, nb_tr_steps = 0, 0
         with tqdm(total=len(train_dataloader), desc=f"Epoch {epoch}") as pbar:
@@ -462,12 +534,16 @@ def main():
                     if args.fp16:
                         # modify learning rate with special warm up BERT uses
                         # if args.fp16 is False, BertAdam is used that handles this automatically
-                        lr_this_step = args.learning_rate * warmup_linear.get_lr(global_step, args.warmup_proportion)
+                        lr_this_step = args.learning_rate * warmup_linear.get_lr_(global_step / num_train_optimization_steps)
                         for param_group in optimizer.param_groups:
                             param_group['lr'] = lr_this_step
                     optimizer.step()
                     optimizer.zero_grad()
                     global_step += 1
+
+                    tb_writer.add_scalar('lr', optimizer.param_groups[0]['lr'], global_step - start_step)
+                    tb_writer.add_scalar('loss', loss.item(), global_step - start_step)
+
 
         # Save a trained model
         ts = time.time()
@@ -475,7 +551,7 @@ def main():
 
         saving_path = args.output_dir
 
-        saving_path = Path(os.path.join(saving_path, args.save_name + st + "_epoch_" + str(epoch + args.already_trained_epoch)))
+        saving_path = Path(os.path.join(saving_path, args.save_name + st + "_epoch_" + str(epoch)))
 
         if saving_path.is_dir() and list(saving_path.iterdir()):
             logging.warning(f"Output directory ({ saving_path }) already exists and is not empty!")

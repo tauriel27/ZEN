@@ -266,19 +266,19 @@ class ZenConfig(object):
                              "or the path to a pretrained model config file (str)")
 
     @classmethod
-    def from_dict(cls, json_object):
+    def from_dict(cls, json_object, ngram_size):
         """Constructs a `BertConfig` from a Python dictionary of parameters."""
-        config = ZenConfig(vocab_size_or_config_json_file=-1, word_vocab_size=104089)
+        config = ZenConfig(vocab_size_or_config_json_file=-1, word_vocab_size=ngram_size)
         for key, value in json_object.items():
             config.__dict__[key] = value
         return config
 
     @classmethod
-    def from_json_file(cls, json_file):
+    def from_json_file(cls, json_file, ngram_size):
         """Constructs a `BertConfig` from a json file of parameters."""
         with open(json_file, "r", encoding='utf-8') as reader:
             text = reader.read()
-        return cls.from_dict(json.loads(text))
+        return cls.from_dict(json.loads(text), ngram_size)
 
     def __repr__(self):
         return str(self.to_json_string())
@@ -729,6 +729,8 @@ class ZenPreTrainedModel(nn.Module):
         kwargs.pop('from_tf', None)
         multift = kwargs.get("multift", False)
         kwargs.pop('multift', None)
+        ngram_size = kwargs.get('ngram_size', 0)
+        kwargs.pop('ngram_size', None)
 
         if pretrained_model_name_or_path in PRETRAINED_MODEL_ARCHIVE_MAP:
             archive_file = PRETRAINED_MODEL_ARCHIVE_MAP[pretrained_model_name_or_path]
@@ -783,7 +785,7 @@ class ZenPreTrainedModel(nn.Module):
             logger.info("loading configuration file {} from cache at {}".format(
                 config_file, resolved_config_file))
         # Load config
-        config = ZenConfig.from_json_file(resolved_config_file)
+        config = ZenConfig.from_json_file(resolved_config_file, ngram_size)
         logger.info("Model config {}".format(config))
         # Instantiate model.
         model = cls(config, *inputs, **kwargs)

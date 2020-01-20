@@ -13,26 +13,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Run token level classification task on ZEN model."""
-
 from __future__ import absolute_import, division, print_function
+
+import sys
+sys.path.insert(0, '/home/lim/anaconda3/envs/pytorch/lib/python3.7/site-packages')
+import torch
+print(f'torch version: {torch.__version__}')
 
 import argparse
 import json
 import logging
 import os
 import random
+import shutil
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
-                              TensorDataset)
+                              TensorDataset, Dataset)
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 from seqeval.metrics import classification_report, f1_score
 import datetime
 
+from tensorboardX import SummaryWriter
 
-from utils_token_level_task import processors, convert_examples_to_features
+# from ignite.engine import Engine, Events, create_supervised_evaluator
+# from ignite.metrics import RunningAverage, Accuracy, Precision, Recall, Loss, TopKCategoricalAccuracy
+#
+# from ignite.contrib.handlers import TensorboardLogger
+# from ignite.contrib.handlers.tensorboard_logger import OutputHandler, OptimizerParamsHandler
+# from ignite.handlers import ModelCheckpoint, EarlyStopping
+
+from utils_token_level_task import processors, convert_examples_to_features, convert_singlel_example_to_feature
 from ZEN import BertTokenizer, BertAdam, WarmupLinearSchedule
 from ZEN import ZenForTokenClassification
 from ZEN import ZenNgramDict
@@ -65,9 +78,32 @@ def load_examples(args, tokenizer, ngram_dict, processor, label_list, mode):
     all_ngram_lengths = torch.tensor([f.ngram_lengths for f in features], dtype=torch.long)
     all_ngram_seg_ids = torch.tensor([f.ngram_seg_ids for f in features], dtype=torch.long)
     all_ngram_masks = torch.tensor([f.ngram_masks for f in features], dtype=torch.long)
-
+    logger.info('Dataset is ready.')
     return TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids, all_ngram_ids,all_ngram_positions,
                          all_ngram_lengths, all_ngram_seg_ids, all_ngram_masks, all_valid_ids, all_lmask_ids)
+
+class BERTDataset(Dataset):
+    def __init__(self, args, tokenizer, ngram_dict, processor, label_list, examples):
+        self.args = args
+        self.tokenizer = tokenizer
+        self.ngram_dict = ngram_dict
+        self.processor = processor
+        self.label_list = label_list
+        self.examples = examples
+        # self.mode = mode
+
+        # if mode == "train":
+        #     self.examples = processor.get_train_examples(args.data_dir)
+        # elif mode == "test":
+        #     self.examples = processor.get_test_examples(args.data_dir)
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, item):
+        example = self.examples[item]
+        feature = convert_singlel_example_to_feature(example, self.label_list, self.args.max_seq_length, self.tokenizer, self.ngram_dict)
+        return feature
 
 def cws_evaluate_word_PRF(y_pred, y):
     #dict = {'E': 2, 'S': 3, 'B':0, 'I':1}
@@ -113,10 +149,12 @@ def save_zen_model(save_zen_model_path, model, tokenizer, ngram_dict, args):
 
 def evaluate(args, model, tokenizer, ngram_dict, processor, label_list):
     num_labels = len(label_list) + 1
-    eval_dataset = load_examples(args, tokenizer, ngram_dict, processor, label_list, mode="test")
+    # eval_dataset = load_examples(args, tokenizer, ngram_dict, processor, label_list, mode="test")
+    examples = processor.get_test_examples(args.data_dir)
+    eval_dataset = BERTDataset(args, tokenizer, ngram_dict, processor, label_list, examples)
     # Run prediction for full data
     eval_sampler = SequentialSampler(eval_dataset)
-    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
+    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, num_workers=8)
 
     # Eval!
     logger.info("***** Running evaluation *****")
@@ -127,8 +165,10 @@ def evaluate(args, model, tokenizer, ngram_dict, processor, label_list):
     y_true = []
     y_pred = []
     label_map = {i: label for i, label in enumerate(label_list, 1)}
+    # label_map = {i: label for i, label in enumerate(label_list, 0)}
+    label_map[0] = '<pad>'
     for batch in tqdm(eval_dataloader, desc="Evaluating"):
-        batch = tuple(t.to(args.device) for t in batch)
+        batch = tuple(t.to(args.device) for t in batch.values())
         input_ids, input_mask, segment_ids, label_ids, ngram_ids, ngram_positions, \
         ngram_lengths, ngram_seg_ids, ngram_masks, valid_ids, l_mask = batch
 
@@ -148,6 +188,14 @@ def evaluate(args, model, tokenizer, ngram_dict, processor, label_list):
                     break
                 y_true.append(label_map[label_ids[i][j]])
                 y_pred.append(label_map[logits[i][j]])
+    # import pickle
+    # pred_fn = 'labels.pred'
+    # with open(os.path.join(args.output_dir, pred_fn), 'wb') as f:
+    #     pickle.dump([y_true, y_pred], f)
+    #
+    # logger.info("Prediction is done.")
+    # exit()
+
     if args.task_name == 'cwsmsra' or args.task_name == 'cwspku':
         #evaluating CWS
         result = cws_evaluate_word_PRF(y_pred, y_true)
@@ -165,19 +213,10 @@ def evaluate(args, model, tokenizer, ngram_dict, processor, label_list):
     return result
 
 def train(args, model, tokenizer, ngram_dict, processor, label_list):
-    train_dataset = load_examples(args, tokenizer, ngram_dict, processor, label_list, mode="train")
-
-    if args.fp16:
-        model.half()
-    if args.local_rank != -1:
-        try:
-            from apex.parallel import DistributedDataParallel as DDP
-        except ImportError:
-            raise ImportError(
-                "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
-        model = DDP(model)
-    elif args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
+    # train_dataset = load_examples(args, tokenizer, ngram_dict, processor, label_list, mode="train")
+    examples = processor.get_train_examples(args.data_dir)
+    train_dataset = BERTDataset(args, tokenizer, ngram_dict, processor, label_list, examples)
+    model = model.cuda()
 
     num_train_optimization_steps = int(
         len(train_dataset) / args.train_batch_size / args.gradient_accumulation_steps) * args.num_train_epochs
@@ -190,31 +229,64 @@ def train(args, model, tokenizer, ngram_dict, processor, label_list):
         {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
         {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
     ]
+
+    optimizer = BertAdam(optimizer_grouped_parameters,
+                         lr=args.learning_rate,
+                         warmup=args.warmup_proportion,
+                         t_total=num_train_optimization_steps)
     if args.fp16:
         try:
-            from apex.optimizers import FP16_Optimizer
-            from apex.optimizers import FusedAdam
+            from apex.parallel import DistributedDataParallel as DDP
+            # from apex.fp16_utils import *
+            from apex import amp, optimizers
+            from apex.multi_tensor_apply import multi_tensor_applier
         except ImportError:
-            raise ImportError(
-                "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
+            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to run this example.")
 
-        optimizer = FusedAdam(optimizer_grouped_parameters,
-                              lr=args.learning_rate,
-                              bias_correction=False,
-                              max_grad_norm=1.0)
-        if args.loss_scale == 0:
-            optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
-        else:
-            optimizer = FP16_Optimizer(optimizer, static_loss_scale=args.loss_scale)
         warmup_linear = WarmupLinearSchedule(warmup=args.warmup_proportion,
                                              t_total=num_train_optimization_steps)
-    else:
-        optimizer = BertAdam(optimizer_grouped_parameters,
-                             lr=args.learning_rate,
-                             warmup=args.warmup_proportion,
-                             t_total=num_train_optimization_steps)
+        model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
+
+    # if args.fp16:
+    #     model.half()
+
+    # Distributed training
+    if args.local_rank != -1:
+        # By default, apex.parallel.DistributedDataParallel overlaps communication with
+        # computation in the backward pass.
+        # model = DDP(model)
+        # delay_allreduce delays all communication to the end of the backward pass.
+        model = DDP(model, delay_allreduce=True)
+    elif args.n_gpu > 1:
+        model = torch.nn.DataParallel(model)
+
+
+    # if args.fp16:
+    #     try:
+    #         from apex.fp16_utils import FP16_Optimizer
+    #         from apex.optimizers import FusedAdam
+    #     except ImportError:
+    #         raise ImportError(
+    #             "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
+    #
+    #     optimizer = FusedAdam(optimizer_grouped_parameters,
+    #                           lr=args.learning_rate,
+    #                           bias_correction=False,
+    #                           )
+    #     if args.loss_scale == 0:
+    #         optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
+    #     else:
+    #         optimizer = FP16_Optimizer(optimizer, static_loss_scale=args.loss_scale)
+
+    # else:
+
+
 
     global_step = 0
+    tb_log_dir = os.path.join(args.output_dir, 'tb-log')
+    if args.local_rank in [-1, 0]:
+        tb_writer = SummaryWriter(tb_log_dir)
+
     logger.info("***** Running training *****")
     logger.info("  Num examples = %d", len(train_dataset))
     logger.info("  Batch size = %d", args.train_batch_size)
@@ -224,7 +296,7 @@ def train(args, model, tokenizer, ngram_dict, processor, label_list):
         train_sampler = RandomSampler(train_dataset)
     else:
         train_sampler = DistributedSampler(train_dataset)
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
+    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=8)
 
     best_f1 = -1
     best_epoch = -1
@@ -234,7 +306,7 @@ def train(args, model, tokenizer, ngram_dict, processor, label_list):
         tr_loss = 0
         nb_tr_examples, nb_tr_steps = 0, 0
         for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
-            batch = tuple(t.to(args.device) for t in batch)
+            batch = tuple(t.to(args.device) for t in batch.values())
             input_ids, input_mask, segment_ids, label_ids, ngram_ids, ngram_positions, ngram_lengths, ngram_seg_ids, ngram_masks, valid_ids, l_mask = batch
             loss = model(input_ids, token_type_ids=None, attention_mask=None, labels=label_ids, valid_ids=valid_ids,
                          attention_mask_label=None, ngram_ids=ngram_ids, ngram_positions=ngram_positions)
@@ -244,7 +316,9 @@ def train(args, model, tokenizer, ngram_dict, processor, label_list):
                 loss = loss / args.gradient_accumulation_steps
 
             if args.fp16:
-                optimizer.backward(loss)
+                # optimizer.backward(loss)
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
             else:
                 loss.backward()
 
@@ -256,18 +330,93 @@ def train(args, model, tokenizer, ngram_dict, processor, label_list):
                     # modify learning rate with special warm up BERT uses
                     # if args.fp16 is False, BertAdam is used that handles this automatically
                     lr_this_step = args.learning_rate * \
-                                   warmup_linear(global_step / num_train_optimization_steps, args.warmup_proportion)
+                                   warmup_linear.get_lr_(global_step / num_train_optimization_steps)
                     for param_group in optimizer.param_groups:
                         param_group['lr'] = lr_this_step
+
                 optimizer.step()
                 optimizer.zero_grad()
                 global_step += 1
-                if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
-                    # Save model checkpoint
-                    output_dir = os.path.join(args.output_dir, "checkpoint-{}".format(global_step))
-                    if not os.path.exists(output_dir):
-                        os.makedirs(output_dir)
+                if args.local_rank in [-1, 0]:
+                    tb_writer.add_scalar('lr', optimizer.param_groups[0]['lr'], global_step)
+                    tb_writer.add_scalar('loss', loss.item(), global_step)
+                # if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
+                #     # Save model checkpoint
+                #     output_dir = os.path.join(args.output_dir, "checkpoint-{}".format(global_step))
+                #     if not os.path.exists(output_dir):
+                #         os.makedirs(output_dir)
+                #     save_zen_model(output_dir, model, tokenizer, ngram_dict, args)
+        if epoch_num % 3 == 0:
+            if args.do_eval and (args.local_rank == -1 or torch.distributed.get_rank() == 0):
+                result = evaluate(args, model, tokenizer, ngram_dict, processor, label_list)
+                tb_writer.add_scalar('f1', result['f1'], global_step)
+                logger.info("\nf1=%s\n" % (str(result["f1"])))
+
+                if result['f1'] > best_f1:
+                    best_f1 = result['f1']
+                    # output_dir = os.path.join(args.output_dir, "checkpoint-{}".format(global_step))
+                    output_dir = os.path.join(args.output_dir, "checkpoint-best")
+
+                    if os.path.exists(output_dir):
+                        shutil.rmtree(output_dir)
+                    os.makedirs(output_dir)
                     save_zen_model(output_dir, model, tokenizer, ngram_dict, args)
+                    logging.info(f'Saving best model, f1 is {best_f1}')
+
+
+def predict(args, model, tokenizer, ngram_dict, processor, label_list):
+    num_labels = len(label_list) + 1
+    # eval_dataset = load_examples(args, tokenizer, ngram_dict, processor, label_list, mode="test")
+    examples = processor.get_test_examples(args.data_dir)
+    eval_dataset = BERTDataset(args, tokenizer, ngram_dict, processor, label_list, examples)
+    # Run prediction for full data
+    eval_sampler = SequentialSampler(eval_dataset)
+    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, num_workers=8)
+
+    # Eval!
+    logger.info("***** Running prediction *****")
+    logger.info("  Num examples = %d", len(eval_dataset))
+    logger.info("  Batch size = %d", args.eval_batch_size)
+
+    model.eval()
+    y_true = []
+    y_pred = []
+    label_map = {i: label for i, label in enumerate(label_list, 1)}
+    # print(label_map)
+    # exit()
+    label_map[0] = '<pad>'
+    for batch in tqdm(eval_dataloader, desc="Evaluating"):
+        batch = tuple(t.to(args.device) for t in batch.values())
+        input_ids, input_mask, segment_ids, label_ids, ngram_ids, ngram_positions, \
+        ngram_lengths, ngram_seg_ids, ngram_masks, valid_ids, l_mask = batch
+
+        with torch.no_grad():
+            logits = model(input_ids, token_type_ids=None, attention_mask=None, labels=None, valid_ids=valid_ids,
+                           attention_mask_label=None, ngram_ids=ngram_ids, ngram_positions=ngram_positions)
+
+        logits = torch.argmax(F.log_softmax(logits, dim=2), dim=2)
+        logits = logits.detach().cpu().numpy()
+        label_ids = label_ids.detach().cpu().numpy()
+
+        # print(label_ids)
+        # print(logits)
+        # exit()
+
+        for i, label in enumerate(label_ids):
+            for j, m in enumerate(label):
+                if j == 0:
+                    continue
+                # if label_ids[i][j] == num_labels - 1:
+                if logits[i][j] == num_labels - 1:
+                    break
+                y_true.append(label_map[label_ids[i][j]])
+                y_pred.append(label_map[logits[i][j]])
+    import pickle
+    pred_fn = 'labels.pred'
+    with open(os.path.join(args.output_dir, pred_fn), 'wb') as f:
+        pickle.dump(y_pred, f)
+    logger.info("Prediction is done.")
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -315,6 +464,9 @@ def main():
     parser.add_argument("--do_eval",
                         action='store_true',
                         help="Whether to run eval on the dev set.")
+    parser.add_argument("--do_predict",
+                        action='store_true',
+                        help="Whether to run predcit on the test set.")
     parser.add_argument("--do_lower_case",
                         action='store_true',
                         help="Set this flag if you are using an uncased model.")
@@ -364,6 +516,9 @@ def main():
                              "Positive power of 2: static loss scaling value.\n")
     parser.add_argument("--save_steps", type=int, default=50,
                         help="Save checkpoint every X updates steps.")
+    parser.add_argument("--finetune_top_only",
+                        action='store_true',
+                        help="Whether to finetune classifier only")
 
     args = parser.parse_args()
 
@@ -396,8 +551,8 @@ def main():
     # Set seed
     set_seed(args)
 
-    if not args.do_train and not args.do_eval:
-        raise ValueError("At least one of `do_train` or `do_eval` must be True.")
+    if not args.do_train and not args.do_eval and not args.do_predict:
+        raise ValueError("At least one of `do_train` or `do_eval` or `do_predict` must be True.")
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train:
         print("Output directory already exists and is not empty.")
@@ -410,7 +565,8 @@ def main():
         raise ValueError("Task not found: %s" % (task_name))
 
     processor = processors[task_name]()
-    label_list = processor.get_labels()
+    label_list = processor.get_labels(args.data_dir)
+    logger.info(f"label_list: {label_list}")
     num_labels = len(label_list) + 1
 
     # Prepare model tokenizer
@@ -421,7 +577,19 @@ def main():
     model = ZenForTokenClassification.from_pretrained(args.bert_model,
                                 cache_dir=cache_dir,
                                 num_labels=num_labels,
-                                multift=args.multift)
+                                multift=args.multift,
+                                ngram_size=ngram_dict.ngram_size)
+
+    for name, parameters in model.named_parameters():
+        # print(name.split('.'))
+        if args.finetune_top_only:
+            if name.split('.')[0] != 'classifier':
+                parameters.requires_grad = False
+        logger.info(f'{name} : {parameters.size()}, {parameters.requires_grad}')
+
+    # for param in model.parameters():
+    #     print(param.size(), param.requires_grad)
+
     model.to(args.device)
 
     if args.do_train:
@@ -429,6 +597,9 @@ def main():
     if args.do_eval and (args.local_rank == -1 or torch.distributed.get_rank() == 0):
         result = evaluate(args, model, tokenizer, ngram_dict, processor, label_list)
         logger.info("\nf1=%s\n" % (str(result["f1"])))
+    if args.do_predict and (args.local_rank == -1 or torch.distributed.get_rank() == 0):
+        predict(args, model, tokenizer, ngram_dict, processor, label_list)
+
 
 if __name__ == "__main__":
     main()
